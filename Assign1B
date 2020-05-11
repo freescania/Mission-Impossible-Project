@@ -1,0 +1,322 @@
+
+### Load Packages
+library(tidyverse) 
+library(reshape2)
+library(lubridate)
+library(ggplot2)
+library(jtools)
+library(tidyr)
+library(caret)
+library(parallel)
+library(doParallel)
+library(ROCR)
+library(DMwR)
+library(pdp)
+library(corrplot)
+
+### Load in data
+repo_tr <- read_csv(file = "repurchase_training.csv")
+
+
+#Check structure
+str(repo_tr)
+glimpse(repo_tr)
+summary(repo_tr)
+
+# drop columns: ID, Age band, gender
+repo_tr <- repo_tr[,-c(1,3,4,6)]
+
+#drop nas
+repo_tr <- repo_tr %>% drop_na()
+
+# Factor categorical variables
+repo_tr$car_model <- as.factor(repo_tr$car_model)
+repo_tr$car_segment <- as.factor(repo_tr$car_segment)
+
+### CHeck Target proportions
+#Simple table
+tbl_train <- table(repo_tr$Target)
+tbl_train
+
+#Make the table into percentages
+tbl_train_prop <- prop.table(tbl_train)
+tbl_train_prop
+
+#Nice graph to show it
+train_prop_plot <- barplot(tbl_train_prop, col = c("blue","red"))
+
+
+###########################
+# Paritioning
+###########################
+
+# We want to partition our data into 70% for training, 30% for testing
+
+# create data partition row list
+
+## 75% of the sample size, use floor to round down to nearest integer
+trainset_size <- floor(0.75 * nrow(repo_tr))
+
+# first step is to set a random seed to ensurre we get the same result each time
+#All random number generators use a seed 
+set.seed(42) 
+
+#get indices of observations to be assigned to training set...
+#this is via randomly picking observations using the sample function
+trainset_indices <- sample(seq_len(nrow(repo_tr)), size = trainset_size)
+
+#assign observations to training and testing sets
+trainset <- repo_tr[trainset_indices, ]
+testset <- repo_tr[-trainset_indices, ]
+
+#rowcounts to check
+nrow(trainset)
+nrow(testset)
+nrow(repo_tr)
+
+###########################
+# Variable selection
+###########################
+
+repo_tr.glm = glm(formula = Target ~ .,
+             data = trainset,
+             family = "binomial")
+summary(repo_tr.glm)
+
+
+# Create probabilities and predictions
+###########################
+
+# add the probabilities to the testing data
+testset$probability = predict(repo_tr.glm, newdata = testset, type = "response")
+
+# assume that the optimum probability threshold is 0.5
+# Create the class prediction - our target is the "Buy" class
+testset$prediction = "NotBuy"
+testset[testset$probability >= 0.5, "prediction"] = "Buy"
+
+###########################
+# Evaluation
+
+# Create a confusion matrix (along with other measures) using the table function
+cfm <- table(predicted=testset$prediction,true=testset$Target)
+cfm
+#Note: the table function is very useful to get category counts, for example, to get
+#counts of true and predicted values:
+table(testset$Target)
+table(testset$prediction)
+
+#Accuracy = fraction of correct predictions
+#i.e. -sum of diagonal terms in confusion matrix by the total number of instances
+accuracy <- (cfm[1,1]+cfm[2,2])/sum(cfm)
+accuracy
+#Another way...
+#Accuracy
+mean(testset$prediction == testset$Target)
+#Why does this work?
+
+#Precision = TP/(TP+FP)
+precision <- cfm[1,1]/(cfm[1,1]+cfm[1,2])
+precision
+
+#Recall = TP/(TP+FN)
+recall <- cfm[1,1]/(cfm[1,1]+cfm[2,1])
+recall
+
+#F1
+f1 <- 2*(precision*recall/(precision+recall))
+f1
+
+
+### Caret
+#Set up basic trainControl() object:
+control_binary <- trainControl(method = "cv",
+                               number = 5,
+                               search="grid",
+                               summaryFunction = twoClassSummary,
+                               classProbs = TRUE,
+                               allowParallel = TRUE
+)
+
+# setup for caret
+trainset$Target <- as.factor(trainset$Target)
+levels(trainset$Target) <- c("NotBuy", "Buy")
+
+testset$Target <- as.factor(testset$Target)
+levels(testset$Target) <- c("NotBuy", "Buy")
+
+#Now we can fit our logistic regression object
+log_fit = train(
+  x = trainset[, -1], 
+  y = trainset$Target, 
+  method = "vglmAdjCat", 
+  trControl = control_binary, 
+  verbose = T,
+  metric = "ROC"
+)
+
+#the model output
+print(log_fit)
+
+#Let's get our predictions using the standard predict function
+testset$predictions = predict(log_fit, newdata = testset[, -1])
+
+#Let us check the confusion matrix
+confusionMatrix(data = testset$predictions, reference = testset$Target,
+                mode = "everything", positive="Buy")
+
+#Note that the ROCR package offers some great metrics by using the 'prediction' function
+#avoid predict and predictions cols
+testset$probability <- predict(log_fit, newdata = testset[, 2:13], type = "prob")
+
+pred = prediction(testset$probability[,2], testset$Target)
+
+#Take a look at the dataframe to see what was added.
+
+#Let us look at the AUC
+auc = performance(pred, "auc")@y.values[[1]]
+auc
+
+#Variable Importance
+imp <- varImp(log_fit)
+imp
+
+### Caret
+### XGBoost Trees
+
+## 75% of the sample size, use floor to round down to nearest integer
+trainset_size <- floor(0.75 * nrow(repo_tr))
+
+# first step is to set a random seed to ensurre we get the same result each time
+#All random number generators use a seed 
+set.seed(42) 
+
+#get indices of observations to be assigned to training set...
+#this is via randomly picking observations using the sample function
+trainset_indices <- sample(seq_len(nrow(repo_tr)), size = trainset_size)
+
+#assign observations to training and testing sets
+trainset <- repo_tr[trainset_indices, ]
+trainset <- trainset[,-2] #drop car models
+testset <- repo_tr[-trainset_indices, ]
+testset <- testset[,-2] #drop car models
+#Set up basic trainControl() object:
+control_binary <- trainControl(method = "cv",
+                               number = 2,
+                               search="random",
+                               sampling =  "smote",
+                               summaryFunction = twoClassSummary,
+                               classProbs = TRUE,
+                               allowParallel = TRUE
+)
+
+# setup for caret
+trainset$Target <- as.factor(trainset$Target)
+levels(trainset$Target) <- c("NotBuy", "Buy")
+
+testset$Target <- as.factor(testset$Target)
+levels(testset$Target) <- c("NotBuy", "Buy")
+
+#Now we can fit our XGBoost regression object
+xgb_fit = train(
+  x = trainset[, -1], 
+  y = trainset$Target, 
+  method = 'xgbTree', #eXtreme Gradient Boosting
+  trControl = control_binary, 
+  verbose = T,
+  metric = "ROC")
+
+
+#the model output
+print(xgb_fit)
+
+#Let's get our predictions using the standard predict function
+testset$predictions = predict(xgb_fit, newdata = testset[, -1])
+
+#Let us check the confusion matrix
+confusionMatrix(data = testset$predictions, reference = testset$Target,
+                mode = "everything", positive="Buy")
+
+#Note that the ROCR package offers some great metrics by using the 'prediction' function
+#avoid predict and predictions cols
+testset$probability <- predict(xgb_fit, newdata = testset[, 2:13], type = "prob")
+
+pred = prediction(testset$probability[,2], testset$Target)
+
+#Take a look at the dataframe to see what was added.
+
+#Let us look at the AUC
+auc = performance(pred, "auc")@y.values[[1]]
+auc
+
+#Variable Importance
+imp <- varImp(xgb_fit)
+imp
+plot(imp)
+
+### Partial Dependency Plots
+
+grid.arrange(
+  partial(xgb_fit, pred.var = "sched_serv_warr", plot = TRUE, rug = TRUE, 
+          type="classification", prob=TRUE, which.class = "Buy", train=trainset),
+  partial(xgb_fit, pred.var = "mth_since_last_serv", plot = TRUE, rug = TRUE, 
+          type="classification", prob=TRUE, which.class="Buy",train=trainset),
+  partial(xgb_fit, pred.var = "annualised_mileage", plot = TRUE, rug = TRUE, 
+          type="classification", prob=TRUE, which.class="Buy",train=trainset),
+  partial(xgb_fit, pred.var = "sched_serv_paid", plot = TRUE, rug = TRUE, 
+          type="classification", prob=TRUE, which.class="Buy",train=trainset),
+  partial(xgb_fit, pred.var = "total_services", plot = TRUE, rug = TRUE, 
+          type="classification", prob=TRUE, which.class="Buy",train=trainset),
+  ncol = 5 
+)
+
+### Check against validation
+
+#Read in validation
+repo_val <- read_csv(file = "repurchase_validation.csv")
+# drop columns: ID, Age band, gender
+repo_val_adj <- repo_val[,-c(2,3,4,5)]
+
+repo_val_adj$predictions = predict(xgb_fit, newdata = repo_val_adj[, -1])
+
+#Let us check the confusion matrix
+confusionMatrix(data = repo_val_adj$predictions, reference = repo_val_adj$Target,
+                mode = "everything", positive="Buy")
+
+#Note that the ROCR package offers some great metrics by using the 'prediction' function
+#avoid predict and predictions cols
+repo_val_adj$probability <- predict(xgb_fit, newdata = repo_val_adj[, 2:13], type = "prob")
+
+#Order for output
+repo_val_out <- repo_val_adj[, c(1,14,13)]
+
+y<- repo_val_out
+# Find all columns that are data.frame
+# Assuming your data frame is stored in variable 'y'
+data.frame.cols <- unname(sapply(y, function(x) class(x) == "data.frame"))
+z <- y[, !data.frame.cols]
+
+# All columns of class "data.frame"
+dfs <- y[, data.frame.cols]
+
+# Recursively unnest each of these columns
+unnest_dataframes <- function(x) {
+  y <- do.call(data.frame, x)
+  if("data.frame" %in% sapply(y, class)) {
+    unnest_dataframes(y)
+  } else {
+    cat('Nested data.frames successfully unpacked\n')
+  }
+  y
+}
+
+df2 <- unnest_dataframes(dfs)
+
+# Combine with original data
+all_columns <- cbind(z, df2)
+
+repo_val_out_fin <- all_columns[,c(1,4,2)]
+names(repo_val_out_fin) <- c('ID','Target Probability','Target Class')
+
+#Print to CSV
+write.csv(repo_val_out_fin,"repurchase_validation_13705761.csv")
